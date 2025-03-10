@@ -1,219 +1,181 @@
-#!/usr/bin/env python3
-# Copyright (c) Meta Platforms, Inc. All Rights Reserved
-"""
-optimizer, ref:
-https://github.com/huggingface/transformers/blob/master/transformers/optimization.property  #noqa
-"""
-import math
+import argparse
+import os
+import pprint
+import shutil
+import sys
+import importlib
+
+import logging
+import time
+import timeit
+from pathlib import Path
+import glob
+
+import re
+
+import numpy as np
+import json
+import warnings
+warnings.filterwarnings("ignore")
 
 import torch
-from torch.optim import Optimizer
-import torch.optim as optim
-from typing import Any, Callable, Iterable, List, Tuple, Optional
+import torch.nn as nn
+import torch.backends.cudnn as cudnn
+import torch.optim
+from tensorboardX import SummaryWriter
+from myDatasets.myPromptAugTileDataset import myTileDataset
 
 
+from torch.optim.lr_scheduler import MultiStepLR, LambdaLR, CosineAnnealingLR, StepLR
 
-def make_optimizer(models, train_params):
-    params = []
-    for model in models:
-        for key, value in model.named_parameters():
-            if value.requires_grad:
-                params.append((key, value))
+from core.function import train, validate, test
+from utils.params import *
+from utils.utils import *
+from utils.spatial_statistics import *
 
-    if train_params.WEIGHT_DECAY > 0:
-        if train_params.OPTIMIZER == 'adamw':
+from torchsampler import ImbalancedDatasetSampler
 
-            no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
-            optimizer_grouped_parameters = [
-                {'params': [p for n, p in params
-                            if not any(nd in n for nd in no_decay)],
-                 'weight_decay': 0.01},
-                {'params': [p for n, p in params
-                            if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
-            ]
-            optimizer = AdamW(
-                optimizer_grouped_parameters,
-                lr=train_params.BASE_LR,
-            )
-        else:
-            _params = []
-            for p in params:
-                key, value = p
-                # print(key)
-                # if not value.requires_grad:
-                #     continue
-                lr = train_params.BASE_LR
-                weight_decay = train_params.WEIGHT_DECAY
-                if "last_layer.bias" in key:
-                    # no regularization (weight decay) for last layer's bias
-                    weight_decay = 0.0
+from pdb import set_trace as st
 
-                if train_params.BIAS_MULTIPLIER == 1.:
-                    _params += [{
-                        "params": [value],
-                        "lr": lr,
-                        "weight_decay": weight_decay
-                    }]
-                else:
-                    if "bias" in key and "last_layer.bias" not in key:
-                        # use updated lr for this param
-                        lr_value = lr * train_params.BIAS_MULTIPLIER
-                    else:
-                        lr_value = lr
+def setup_seed(seed):
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+# 设置随机数种子
 
+def main():
 
-                    _params += [{
-                        "params": [value],
-                        "lr": lr_value,
-                        "weight_decay": weight_decay
-                    }]
+    args=parse_args()
 
-            if train_params.OPTIMIZER == 'adam':
-                optimizer = optim.Adam(
-                    _params,
-                    lr=train_params.BASE_LR,
-                    weight_decay=train_params.WEIGHT_DECAY,
-                )
-            else:
-                optimizer = optim.SGD(
-                    _params,
-                    train_params.BASE_LR,
-                    momentum=train_params.MOMENTUM,
-                    weight_decay=train_params.WEIGHT_DECAY
-                )
-        return optimizer
+    RESUME_FOLDERS=glob.glob(os.path.join(args.resume_from,args.resume_keywords))
+    print(toGreen(f'finging {len(RESUME_FOLDERS)} folders'))
+    assert len(RESUME_FOLDERS)==1
+    RESUME_FOLDER = RESUME_FOLDERS[0]
+
+    with open(os.path.join(RESUME_FOLDER,'commandline_args.json'), 'r') as json_file:
+        args_json = json.load(json_file)
+        print(toGreen(f'updating args from commandline_args.json'))
+        for key, value in args_json.items():
+            if key == 'gaussian_noise': continue
+            setattr(args, key, value)
+
+    CKPT_PATH=os.path.join(args.snapshot_dir,'best.pth')
+
+    if args.data_version==0:
+        args.data_dir='/home/comp/chongyin/DataSets/Liver-NASH/MICCAI21-Box-22/clean_structures/'
+        args.file_list_folder='/home/comp/chongyin/DataSets/Liver-NASH/MICCAI21-Box-22/CVFold/'
+    elif args.data_version==1:
+        args.data_dir='/home/comp/chongyin/DataSets/LiverNASTiles-20230727/clean_structures'
+        args.file_list_folder='/home/comp/chongyin/DataSets/LiverNASTiles-20230727/CVFold'
+    elif args.data_version==2:
+        args.data_dir='/home/comp/chongyin/DataSets/NAFLD_NORMAL_ANOMALY_HE_MOUSE_LIVER/'
+        args.file_list_folder='/home/comp/chongyin/DataSets/NAFLD_NORMAL_ANOMALY_HE_MOUSE_LIVER/CVFold/'
+
+    if 'none' not in args.prompt_index_str_s:
+        args.prompt_s_num=len(args.prompt_index_str_s.split('-'))
     else:
-        if train_params.OPTIMIZER == 'adam':
-            optimizer = optim.Adam(
-                model.parameters(),
-                lr=train_params.BASE_LR
-            )
-        else:
-            _params = []
-            for p in params:
-                key, value = p
+        args.prompt_s_num=0
+    if 'none' not in args.prompt_index_str_m:
+        args.prompt_m_num=len(args.prompt_index_str_m.split('-'))
+    else:
+        args.prompt_m_num=0
 
-                lr = train_params.BASE_LR
-
-                if train_params.BIAS_MULTIPLIER == 1.:
-                    _params += [{
-                        "params": [value],
-                        "lr": lr,
-                    }]
-                else:
-                    if "bias" in key and "last_layer.bias" not in key:
-                        # use updated lr for this param
-                        lr_value = lr * train_params.BIAS_MULTIPLIER
-                    else:
-                        lr_value = lr
-
-                    if train_params.DBG_TRAINABLE:
-                        logger.info("\t{}, {:.4f}".format(key, lr_value))
-
-                    _params += [{
-                        "params": [value],
-                        "lr": lr_value,
-                    }]
-            optimizer = optim.SGD(
-                _params,
-                train_params.BASE_LR,
-                momentum=train_params.MOMENTUM,
-            )
-        return optimizer
+    # 5-fold cross validation
+    args.model_name= f'F{args.fold}-{args.model_name}-mv{args.mversion}-seed{args.seed}'
 
 
-class AdamW(Optimizer):
-    """ Implements Adam algorithm with weight decay fix.
-    Parameters:
-        lr (float): learning rate. Default 1e-3.
-        betas (tuple of 2 floats): Adams beta parameters (b1, b2). Default: (0.9, 0.999)
-        eps (float): Adams epsilon. Default: 1e-6
-        weight_decay (float): Weight decay. Default: 0.0
-        correct_bias (bool): can be set to False to avoid correcting bias in Adam (e.g. like in Bert TF repository). Default True.
-    """
+    # cudnn related setting
+    gpus = [ii for ii in range(args.gpus)]
 
-    def __init__(
-        self,
-        params: Iterable,
-        lr: float = 1e-3,
-        betas: Tuple[float, float] = (0.9, 0.999),
-        eps: float = 1e-6,
-        weight_decay: float = 0.0,
-        correct_bias: bool = True
-    ) -> None:
-        if lr < 0.0:
-            raise ValueError("Invalid learning rate: {} - should be >= 0.0".format(lr))
-        if not 0.0 <= betas[0] < 1.0:
-            raise ValueError("Invalid beta parameter: {} - should be in [0.0, 1.0[".format(betas[0]))
-        if not 0.0 <= betas[1] < 1.0:
-            raise ValueError("Invalid beta parameter: {} - should be in [0.0, 1.0[".format(betas[1]))
-        if not 0.0 <= eps:
-            raise ValueError("Invalid epsilon value: {} - should be >= 0.0".format(eps))
-        defaults = {
-            "lr": lr, "betas": betas, "eps": eps,
-            "weight_decay": weight_decay, "correct_bias": correct_bias
-        }
-        super(AdamW, self).__init__(params, defaults)
+    setup_seed(args.seed)
+    # prepare data
+    if args.build_prompt:
+        build_prompt(args.data_dir,args.file_list_folder)
 
-    def step(self, closure: Optional[Callable] = None) -> Optional[Callable]:
-        """Performs a single optimization step.
-        Arguments:
-            closure (callable, optional): A closure that reevaluates the model
-                and returns the loss.
-        """
-        loss = None
-        if closure is not None:
-            loss = closure()
+    _x_train = [os.path.join(args.file_list_folder, 'train_fold_'+str(args.fold)+'.txt')]
+    _x_val = [os.path.join(args.file_list_folder, 'val_fold_'+str(args.fold)+'.txt')]
+    _x_test = [os.path.join(args.file_list_folder, 'test_fold_'+str(args.fold)+'.txt')]
+    
 
-        for group in self.param_groups:
-            for p in group['params']:
-                if p.grad is None:
-                    continue
-                grad = p.grad.data
-                if grad.is_sparse:
-                    raise RuntimeError(
-                        "Adam does not support sparse gradients, "
-                        "please consider SparseAdam instead")
+    x_train =readlines_from_txt(_x_train)
+    if args.ratio<1.0: x_train=balance_sampler(x_train,args.ratio)
 
-                state = self.state[p]
+    x_val =readlines_from_txt(_x_val)
+    x_test =readlines_from_txt(_x_test)
 
-                # State initialization
-                if len(state) == 0:
-                    state['step'] = 0
-                    # Exponential moving average of gradient values
-                    state['exp_avg'] = torch.zeros_like(p.data)
-                    # Exponential moving average of squared gradient values
-                    state['exp_avg_sq'] = torch.zeros_like(p.data)
 
-                exp_avg, exp_avg_sq = state['exp_avg'], state['exp_avg_sq']
-                beta1, beta2 = group['betas']
+    train_dataset=myTileDataset(x_train,args.data_dir,h=args.img_h,w=args.img_w,is_training=True,xprompt=args.xprompt,prompt_index_str_s=args.prompt_index_str_s,prompt_index_str_m=args.prompt_index_str_m,norm_props=args.norm_props,augment=args.augment,auto_augment=args.auto_augment,args=args)
+    val_dataset=myTileDataset(x_val,args.data_dir,h=args.img_h,w=args.img_w,xprompt=args.xprompt,prompt_index_str_s=args.prompt_index_str_s,prompt_index_str_m=args.prompt_index_str_m,norm_props=args.norm_props,args=args)
+    test_dataset=myTileDataset(x_test,args.data_dir,h=args.img_h,w=args.img_w,is_training=True,xprompt=args.xprompt,prompt_index_str_s=args.prompt_index_str_s,prompt_index_str_m=args.prompt_index_str_m,norm_props=args.norm_props,args=args)
 
-                state['step'] += 1
+    trainloader = torch.utils.data.DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        prefetch_factor=2,
+        shuffle=False,
+        num_workers=args.workers,
+        pin_memory=True,
+        drop_last=True,
+        sampler=ImbalancedDatasetSampler(train_dataset))
 
-                # Decay the first and second moment running average coefficient
-                # In-place operations to update the averages at the same time
-                exp_avg.mul_(beta1).add_(1.0 - beta1, grad)
-                exp_avg_sq.mul_(beta2).addcmul_(1.0 - beta2, grad, grad)
-                denom = exp_avg_sq.sqrt().add_(group['eps'])
+    valloader = torch.utils.data.DataLoader(
+        val_dataset,
+        batch_size=args.batch_size_for_test,
+        shuffle=False,
+        num_workers=args.workers,
+        pin_memory=True)
 
-                step_size = group['lr']
-                if group['correct_bias']:  # No bias correction for Bert
-                    bias_correction1 = 1.0 - beta1 ** state['step']
-                    bias_correction2 = 1.0 - beta2 ** state['step']
-                    step_size = step_size * math.sqrt(
-                        bias_correction2) / bias_correction1
+    testloader = torch.utils.data.DataLoader(
+        test_dataset,
+        batch_size=args.batch_size_for_test,
+        shuffle=False,
+        num_workers=args.workers,
+        pin_memory=True)
 
-                p.data.addcdiv_(-step_size, exp_avg, denom)
 
-                # Just adding the square of the weights to the loss function is *not*
-                # the correct way of using L2 regularization/weight decay with Adam,
-                # since that will interact with the m and v parameters in strange ways.
-                #
-                # Instead we want to decay the weights in a manner that doesn't interact
-                # with the m/v parameters. This is equivalent to adding the square
-                # of the weights to the loss with plain (non-momentum) SGD.
-                # Add weight decay at the end (fixed version)
-                if group['weight_decay'] > 0.0:
-                    p.data.add_(-group['lr'] * group['weight_decay'], p.data)
+     # # model configuration
+    module=importlib.import_module(f'models.model_v{args.mversion}')
+    XPrompt = getattr(module, 'XPrompt')
+    model=XPrompt(args)
+    print(toRed(f'version-{args.mversion}'))
 
-        return loss
+
+    
+    model=XPrompt(args)
+    print(toRed(f'version-{args.mversion}'))
+
+    model = model.cuda()
+
+    ## load the ckpt dict
+    model_state_file = CKPT_PATH
+    print(toGreen(f'loading ckpt {CKPT_PATH}'))
+    pretrained_dict = torch.load(model_state_file)
+    model_dict = model.state_dict()
+    pretrained_dict = {k: v for k, v in pretrained_dict.items()
+                           if k in model_dict.keys()}
+    # for k, _ in pretrained_dict.items():
+    #     print(toCyan('=> loading {} from pretrained model'.format(k)))
+    model_dict.update(pretrained_dict)
+    model.load_state_dict(model_dict)
+
+   
+    gts, predicts, probs, accuracy, specificity, recall, f1, auc, con_mat, ovr_mat = test(model, testloader, writer_dict=None, args=args)
+
+    test_result = np.concatenate([np.expand_dims(gts,-1),np.expand_dims(predicts,-1),probs],axis=-1)
+
+    test_msg = f'{args.model_name}:Accuracy:{accuracy*100:.3f}, Specificity:{specificity*100:.3f}, Recall:{recall*100:.3f}, F1:{f1*100:.3f}, AUC:{auc*100:.3f}'
+
+    print(toRed(f'GaussianNoise: {args.gaussian_noise}'))
+    print(toRed(test_msg))
+
+        
+
+
+
+   
+
+if __name__ == '__main__':
+    main()
